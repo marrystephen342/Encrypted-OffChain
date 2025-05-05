@@ -249,3 +249,116 @@
     (ok true)
   )
 )
+
+
+
+(define-map vault-access-control
+  { vault-id: uint, accessor: principal }
+  { 
+    can-read: bool,
+    granted-at: uint,
+    granted-by: principal
+  }
+)
+
+(define-public (grant-vault-access (vault-id uint) (accessor principal))
+  (let
+    (
+      (user tx-sender)
+      (vault-data (map-get? vault-metadata { vault-id: vault-id }))
+    )
+    (asserts! (is-some vault-data) (err err-not-found))
+    (asserts! (owns-token vault-id user) (err err-not-token-owner))
+    
+    (map-set vault-access-control
+      { vault-id: vault-id, accessor: accessor }
+      {
+        can-read: true,
+        granted-at: stacks-block-height,
+        granted-by: user
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-vault-access (vault-id uint) (accessor principal))
+  (let
+    (
+      (user tx-sender)
+    )
+    (asserts! (owns-token vault-id user) (err err-not-token-owner))
+    (map-delete vault-access-control { vault-id: vault-id, accessor: accessor })
+    (ok true)
+  )
+)
+
+(define-read-only (can-access-vault (vault-id uint) (accessor principal))
+  (let ((access-data (map-get? vault-access-control { vault-id: vault-id, accessor: accessor })))
+    (if (is-some access-data)
+      (get can-read (unwrap-panic access-data))
+      false
+    )
+  )
+)
+
+
+
+(define-map entry-tags
+  { vault-id: uint, entry-id: uint, tag: (string-ascii 20) }
+  { created-at: uint }
+)
+
+(define-map entry-tag-count
+  { vault-id: uint, entry-id: uint }
+  { count: uint }
+)
+
+(define-public (add-entry-tag (vault-id uint) (entry-id uint) (tag (string-ascii 20)))
+  (let
+    (
+      (user tx-sender)
+      (entry (map-get? vault-entries { vault-id: vault-id, entry-id: entry-id }))
+      (current-count (default-to { count: u0 } 
+        (map-get? entry-tag-count { vault-id: vault-id, entry-id: entry-id })))
+    )
+    (asserts! (is-some entry) (err err-not-found))
+    (asserts! (owns-token vault-id user) (err err-not-token-owner))
+    
+    (map-set entry-tags
+      { vault-id: vault-id, entry-id: entry-id, tag: tag }
+      { created-at: stacks-block-height }
+    )
+    
+    (map-set entry-tag-count
+      { vault-id: vault-id, entry-id: entry-id }
+      { count: (+ (get count current-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-entry-tag (vault-id uint) (entry-id uint) (tag (string-ascii 20)))
+  (let
+    (
+      (user tx-sender)
+      (current-count (default-to { count: u0 } 
+        (map-get? entry-tag-count { vault-id: vault-id, entry-id: entry-id })))
+    )
+    (asserts! (owns-token vault-id user) (err err-not-token-owner))
+    
+    (map-delete entry-tags { vault-id: vault-id, entry-id: entry-id, tag: tag })
+    
+    (map-set entry-tag-count
+      { vault-id: vault-id, entry-id: entry-id }
+      { count: (- (get count current-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (has-tag (vault-id uint) (entry-id uint) (tag (string-ascii 20)))
+  (is-some (map-get? entry-tags { vault-id: vault-id, entry-id: entry-id, tag: tag }))
+)
