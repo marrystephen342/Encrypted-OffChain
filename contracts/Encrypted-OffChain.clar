@@ -362,3 +362,155 @@
 (define-read-only (has-tag (vault-id uint) (entry-id uint) (tag (string-ascii 20)))
   (is-some (map-get? entry-tags { vault-id: vault-id, entry-id: entry-id, tag: tag }))
 )
+
+
+(define-map vault-time-limited-access
+  { vault-id: uint, accessor: principal }
+  {
+    expires-at: uint,
+    granted-at: uint,
+    granted-by: principal,
+    access-fee: uint
+  }
+)
+
+(define-map pending-access-payments
+  { vault-id: uint, accessor: principal }
+  { amount: uint }
+)
+
+(define-data-var platform-fee-rate uint u250)
+
+(define-public (grant-time-limited-access (vault-id uint) (accessor principal) (duration-blocks uint) (access-fee uint))
+  (let
+    (
+      (user tx-sender)
+      (vault-data (map-get? vault-metadata { vault-id: vault-id }))
+      (expires-at (+ stacks-block-height duration-blocks))
+    )
+    (asserts! (is-some vault-data) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    (asserts! (> duration-blocks u0) err-invalid-input)
+    
+    (map-set vault-time-limited-access
+      { vault-id: vault-id, accessor: accessor }
+      {
+        expires-at: expires-at,
+        granted-at: stacks-block-height,
+        granted-by: user,
+        access-fee: access-fee
+      }
+    )
+    
+    (if (> access-fee u0)
+      (map-set pending-access-payments
+        { vault-id: vault-id, accessor: accessor }
+        { amount: access-fee }
+      )
+      true
+    )
+    
+    (ok expires-at)
+  )
+)
+
+(define-public (pay-for-vault-access (vault-id uint))
+  (let
+    (
+      (user tx-sender)
+      (payment-data (map-get? pending-access-payments { vault-id: vault-id, accessor: user }))
+      (vault-data (map-get? vault-metadata { vault-id: vault-id }))
+      (access-data (map-get? vault-time-limited-access { vault-id: vault-id, accessor: user }))
+    )
+    (asserts! (is-some payment-data) err-not-found)
+    (asserts! (is-some vault-data) err-not-found)
+    (asserts! (is-some access-data) err-not-found)
+    
+    (let
+      (
+        (payment-amount (get amount (unwrap-panic payment-data)))
+        (vault-owner (get owner (unwrap-panic vault-data)))
+        (platform-fee (/ (* payment-amount (var-get platform-fee-rate)) u10000))
+        (owner-payment (- payment-amount platform-fee))
+      )
+      (try! (stx-transfer? owner-payment user vault-owner))
+      (try! (stx-transfer? platform-fee user contract-owner))
+      
+      (map-delete pending-access-payments { vault-id: vault-id, accessor: user })
+      (ok true)
+    )
+  )
+)
+
+(define-public (revoke-time-limited-access (vault-id uint) (accessor principal))
+  (let
+    (
+      (user tx-sender)
+    )
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    (map-delete vault-time-limited-access { vault-id: vault-id, accessor: accessor })
+    (map-delete pending-access-payments { vault-id: vault-id, accessor: accessor })
+    (ok true)
+  )
+)
+
+(define-read-only (can-access-vault-time-limited (vault-id uint) (accessor principal))
+  (let 
+    (
+      (access-data (map-get? vault-time-limited-access { vault-id: vault-id, accessor: accessor }))
+      (payment-pending (is-some (map-get? pending-access-payments { vault-id: vault-id, accessor: accessor })))
+    )
+    (if (is-some access-data)
+      (let ((access-info (unwrap-panic access-data)))
+        (and 
+          (< stacks-block-height (get expires-at access-info))
+          (not payment-pending)
+        )
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (get-time-limited-access-info (vault-id uint) (accessor principal))
+  (map-get? vault-time-limited-access { vault-id: vault-id, accessor: accessor })
+)
+
+(define-read-only (get-pending-payment (vault-id uint) (accessor principal))
+  (map-get? pending-access-payments { vault-id: vault-id, accessor: accessor })
+)
+
+(define-read-only (has-valid-access (vault-id uint) (accessor principal))
+  (or 
+    (can-access-vault vault-id accessor)
+    (can-access-vault-time-limited vault-id accessor)
+    (owns-token vault-id accessor)
+  )
+)
+
+(define-public (cleanup-expired-access (vault-id uint) (accessor principal))
+  (let
+    (
+      (access-data (map-get? vault-time-limited-access { vault-id: vault-id, accessor: accessor }))
+    )
+    (asserts! (is-some access-data) err-not-found)
+    (asserts! (>= stacks-block-height (get expires-at (unwrap-panic access-data))) err-unauthorized)
+    
+    (map-delete vault-time-limited-access { vault-id: vault-id, accessor: accessor })
+    (map-delete pending-access-payments { vault-id: vault-id, accessor: accessor })
+    (ok true)
+  )
+)
+
+(define-public (set-platform-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u1000) err-invalid-input)
+    (var-set platform-fee-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-read-only (get-platform-fee-rate)
+  (var-get platform-fee-rate)
+)
