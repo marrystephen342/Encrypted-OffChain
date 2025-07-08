@@ -96,8 +96,8 @@
       (new-vault-id (+ (var-get last-vault-id) u1))
       (user tx-sender)
     )
-    (asserts! (is-some (map-get? user-vault-entries { user: user })) (err err-unauthorized))
-    ;; (try! (nft-mint? vault-access new-vault-id user))
+    (asserts! (is-some (map-get? user-vault-entries { user: user })) err-unauthorized)
+    (try! (nft-mint? vault-access new-vault-id user))
     (map-set vault-metadata
       { vault-id: new-vault-id }
       {
@@ -236,10 +236,10 @@
       (user tx-sender)
       (vault-data (map-get? vault-metadata { vault-id: vault-id }))
     )
-    (asserts! (is-some vault-data) (err err-not-found))
-    (asserts! (owns-token vault-id user) (err err-not-token-owner))
+    (asserts! (is-some vault-data) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
     
-    ;; (try! (nft-transfer? vault-access vault-id user recipient))
+    (try! (nft-transfer? vault-access vault-id user recipient))
     
     (map-set vault-metadata
       { vault-id: vault-id }
@@ -513,4 +513,152 @@
 
 (define-read-only (get-platform-fee-rate)
   (var-get platform-fee-rate)
+)
+
+(define-data-var last-snapshot-id uint u0)
+
+(define-map vault-snapshots
+  { vault-id: uint, snapshot-id: uint }
+  {
+    name: (string-ascii 50),
+    created-at: uint,
+    entry-count: uint,
+    creator: principal
+  }
+)
+
+(define-map snapshot-entries
+  { vault-id: uint, snapshot-id: uint, entry-id: uint }
+  {
+    encrypted-data: (string-ascii 1024),
+    metadata: (string-ascii 255),
+    tags: (list 10 (string-ascii 20))
+  }
+)
+
+(define-map vault-snapshot-count
+  { vault-id: uint }
+  { count: uint }
+)
+
+(define-read-only (get-vault-snapshot-count (vault-id uint))
+  (default-to { count: u0 } (map-get? vault-snapshot-count { vault-id: vault-id }))
+)
+
+(define-read-only (get-snapshot-info (vault-id uint) (snapshot-id uint))
+  (map-get? vault-snapshots { vault-id: vault-id, snapshot-id: snapshot-id })
+)
+
+(define-read-only (get-snapshot-entry (vault-id uint) (snapshot-id uint) (entry-id uint))
+  (map-get? snapshot-entries { vault-id: vault-id, snapshot-id: snapshot-id, entry-id: entry-id })
+)
+
+(define-private (collect-entry-tags (entry-id uint) (vault-id uint) (tags (list 10 (string-ascii 20))))
+  (let
+    (
+      (tag-1 "crypto")
+      (tag-2 "personal")
+      (tag-3 "work")
+      (tag-4 "backup")
+      (tag-5 "temp")
+    )
+    (list tag-1 tag-2 tag-3 tag-4 tag-5)
+  )
+)
+
+(define-public (create-vault-snapshot (vault-id uint) (snapshot-name (string-ascii 50)))
+  (let
+    (
+      (user tx-sender)
+      (vault-data (map-get? vault-metadata { vault-id: vault-id }))
+      (entry-count-data (get-vault-entry-count vault-id))
+      (snapshot-count-data (get-vault-snapshot-count vault-id))
+      (new-snapshot-id (+ (var-get last-snapshot-id) u1))
+      (new-vault-snapshot-count (+ (get count snapshot-count-data) u1))
+    )
+    (asserts! (is-some vault-data) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    
+    (map-set vault-snapshots
+      { vault-id: vault-id, snapshot-id: new-snapshot-id }
+      {
+        name: snapshot-name,
+        created-at: stacks-block-height,
+        entry-count: (get count entry-count-data),
+        creator: user
+      }
+    )
+    
+    (map-set vault-snapshot-count
+      { vault-id: vault-id }
+      { count: new-vault-snapshot-count }
+    )
+    
+    (var-set last-snapshot-id new-snapshot-id)
+    (ok new-snapshot-id)
+  )
+)
+
+(define-public (snapshot-vault-entry (vault-id uint) (snapshot-id uint) (entry-id uint))
+  (let
+    (
+      (user tx-sender)
+      (entry-data (map-get? vault-entries { vault-id: vault-id, entry-id: entry-id }))
+      (snapshot-info (map-get? vault-snapshots { vault-id: vault-id, snapshot-id: snapshot-id }))
+    )
+    (asserts! (is-some entry-data) err-not-found)
+    (asserts! (is-some snapshot-info) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    
+    (let ((entry (unwrap-panic entry-data)))
+      (map-set snapshot-entries
+        { vault-id: vault-id, snapshot-id: snapshot-id, entry-id: entry-id }
+        {
+          encrypted-data: (get encrypted-data entry),
+          metadata: (get metadata entry),
+          tags: (collect-entry-tags entry-id vault-id (list))
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (restore-from-snapshot (vault-id uint) (snapshot-id uint) (entry-id uint))
+  (let
+    (
+      (user tx-sender)
+      (snapshot-entry (map-get? snapshot-entries { vault-id: vault-id, snapshot-id: snapshot-id, entry-id: entry-id }))
+      (snapshot-info (map-get? vault-snapshots { vault-id: vault-id, snapshot-id: snapshot-id }))
+    )
+    (asserts! (is-some snapshot-entry) err-not-found)
+    (asserts! (is-some snapshot-info) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    
+    (let ((entry (unwrap-panic snapshot-entry)))
+      (map-set vault-entries
+        { vault-id: vault-id, entry-id: entry-id }
+        {
+          encrypted-data: (get encrypted-data entry),
+          metadata: (get metadata entry),
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (delete-vault-snapshot (vault-id uint) (snapshot-id uint))
+  (let
+    (
+      (user tx-sender)
+      (snapshot-info (map-get? vault-snapshots { vault-id: vault-id, snapshot-id: snapshot-id }))
+    )
+    (asserts! (is-some snapshot-info) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    
+    (map-delete vault-snapshots { vault-id: vault-id, snapshot-id: snapshot-id })
+    (ok true)
+  )
 )
