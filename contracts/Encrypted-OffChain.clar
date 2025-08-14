@@ -662,3 +662,357 @@
     (ok true)
   )
 )
+
+;; Vault Inheritance Protocol
+(define-data-var inheritance-claim-period uint u144000) ;; ~100 days in blocks
+
+(define-map vault-inheritance-rules
+  { vault-id: uint }
+  {
+    beneficiary: principal,
+    backup-beneficiary: principal,
+    inheritance-delay: uint,
+    requires-verification: bool,
+    created-at: uint,
+    last-owner-activity: uint
+  }
+)
+
+(define-map inheritance-claims
+  { vault-id: uint, claimant: principal }
+  {
+    claim-initiated-at: uint,
+    verification-deadline: uint,
+    claim-status: (string-ascii 20),
+    required-confirmations: uint,
+    current-confirmations: uint
+  }
+)
+
+(define-map inheritance-verifiers
+  { vault-id: uint, verifier: principal }
+  {
+    authorized-by: principal,
+    verification-weight: uint,
+    added-at: uint
+  }
+)
+
+(define-map verifier-confirmations
+  { vault-id: uint, verifier: principal, claimant: principal }
+  {
+    confirmed-at: uint,
+    verification-message: (string-ascii 100)
+  }
+)
+
+(define-map vault-inheritance-activity
+  { vault-id: uint }
+  { last-activity-block: uint }
+)
+
+;; Read-only functions for inheritance system
+(define-read-only (get-inheritance-rules (vault-id uint))
+  (map-get? vault-inheritance-rules { vault-id: vault-id })
+)
+
+(define-read-only (get-inheritance-claim (vault-id uint) (claimant principal))
+  (map-get? inheritance-claims { vault-id: vault-id, claimant: claimant })
+)
+
+(define-read-only (get-vault-activity (vault-id uint))
+  (default-to { last-activity-block: u0 } 
+    (map-get? vault-inheritance-activity { vault-id: vault-id }))
+)
+
+(define-read-only (is-inheritance-eligible (vault-id uint))
+  (let 
+    (
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+      (activity (get-vault-activity vault-id))
+    )
+    (if (is-some rules)
+      (let ((rule-data (unwrap-panic rules)))
+        (>= (- stacks-block-height (get last-activity-block activity)) 
+            (get inheritance-delay rule-data))
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (can-claim-inheritance (vault-id uint) (claimant principal))
+  (let ((rules (map-get? vault-inheritance-rules { vault-id: vault-id })))
+    (if (is-some rules)
+      (let ((rule-data (unwrap-panic rules)))
+        (and 
+          (or 
+            (is-eq claimant (get beneficiary rule-data))
+            (is-eq claimant (get backup-beneficiary rule-data))
+          )
+          (is-inheritance-eligible vault-id)
+        )
+      )
+      false
+    )
+  )
+)
+
+;; Update vault activity tracker
+(define-private (update-vault-activity (vault-id uint))
+  (map-set vault-inheritance-activity
+    { vault-id: vault-id }
+    { last-activity-block: stacks-block-height }
+  )
+)
+
+;; Setup inheritance rules for a vault
+(define-public (setup-vault-inheritance 
+  (vault-id uint) 
+  (beneficiary principal) 
+  (backup-beneficiary principal) 
+  (inheritance-delay uint)
+  (requires-verification bool))
+  (let
+    (
+      (user tx-sender)
+      (vault-data (map-get? vault-metadata { vault-id: vault-id }))
+    )
+    (asserts! (is-some vault-data) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    (asserts! (> inheritance-delay u1000) err-invalid-input) ;; Minimum ~16 hours
+    (asserts! (not (is-eq beneficiary user)) err-invalid-input)
+    (asserts! (not (is-eq backup-beneficiary user)) err-invalid-input)
+    
+    (map-set vault-inheritance-rules
+      { vault-id: vault-id }
+      {
+        beneficiary: beneficiary,
+        backup-beneficiary: backup-beneficiary,
+        inheritance-delay: inheritance-delay,
+        requires-verification: requires-verification,
+        created-at: stacks-block-height,
+        last-owner-activity: stacks-block-height
+      }
+    )
+    
+    (update-vault-activity vault-id)
+    (ok true)
+  )
+)
+
+;; Authorize verifiers for inheritance claims
+(define-public (authorize-inheritance-verifier (vault-id uint) (verifier principal) (weight uint))
+  (let
+    (
+      (user tx-sender)
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+    )
+    (asserts! (is-some rules) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    (asserts! (and (> weight u0) (<= weight u10)) err-invalid-input)
+    (asserts! (not (is-eq verifier user)) err-invalid-input)
+    
+    (map-set inheritance-verifiers
+      { vault-id: vault-id, verifier: verifier }
+      {
+        authorized-by: user,
+        verification-weight: weight,
+        added-at: stacks-block-height
+      }
+    )
+    
+    (update-vault-activity vault-id)
+    (ok true)
+  )
+)
+
+;; Initiate inheritance claim
+(define-public (initiate-inheritance-claim (vault-id uint))
+  (let
+    (
+      (user tx-sender)
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+      (existing-claim (map-get? inheritance-claims { vault-id: vault-id, claimant: user }))
+    )
+    (asserts! (is-some rules) err-not-found)
+    (asserts! (is-none existing-claim) err-already-exists)
+    (asserts! (can-claim-inheritance vault-id user) err-unauthorized)
+    
+    (let 
+      (
+        (rule-data (unwrap-panic rules))
+        (verification-period (var-get inheritance-claim-period))
+        (required-confirmations (if (get requires-verification rule-data) u2 u0))
+      )
+      (map-set inheritance-claims
+        { vault-id: vault-id, claimant: user }
+        {
+          claim-initiated-at: stacks-block-height,
+          verification-deadline: (+ stacks-block-height verification-period),
+          claim-status: "pending",
+          required-confirmations: required-confirmations,
+          current-confirmations: u0
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Verify inheritance claim by authorized verifier
+(define-public (verify-inheritance-claim (vault-id uint) (claimant principal) (message (string-ascii 100)))
+  (let
+    (
+      (user tx-sender)
+      (verifier-data (map-get? inheritance-verifiers { vault-id: vault-id, verifier: user }))
+      (claim (map-get? inheritance-claims { vault-id: vault-id, claimant: claimant }))
+      (existing-confirmation (map-get? verifier-confirmations { vault-id: vault-id, verifier: user, claimant: claimant }))
+    )
+    (asserts! (is-some verifier-data) err-unauthorized)
+    (asserts! (is-some claim) err-not-found)
+    (asserts! (is-none existing-confirmation) err-already-exists)
+    
+    (let 
+      (
+        (claim-data (unwrap-panic claim))
+        (verifier-info (unwrap-panic verifier-data))
+        (new-confirmations (+ (get current-confirmations claim-data) (get verification-weight verifier-info)))
+      )
+      (asserts! (< stacks-block-height (get verification-deadline claim-data)) err-unauthorized)
+      
+      ;; Record verifier confirmation
+      (map-set verifier-confirmations
+        { vault-id: vault-id, verifier: user, claimant: claimant }
+        {
+          confirmed-at: stacks-block-height,
+          verification-message: message
+        }
+      )
+      
+      ;; Update claim with new confirmation count
+      (map-set inheritance-claims
+        { vault-id: vault-id, claimant: claimant }
+        (merge claim-data { current-confirmations: new-confirmations })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute inheritance claim and transfer vault ownership
+(define-public (execute-inheritance-claim (vault-id uint))
+  (let
+    (
+      (user tx-sender)
+      (claim (map-get? inheritance-claims { vault-id: vault-id, claimant: user }))
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+      (vault-data (map-get? vault-metadata { vault-id: vault-id }))
+    )
+    (asserts! (is-some claim) err-not-found)
+    (asserts! (is-some rules) err-not-found)
+    (asserts! (is-some vault-data) err-not-found)
+    
+    (let 
+      (
+        (claim-data (unwrap-panic claim))
+        (rule-data (unwrap-panic rules))
+        (current-owner (get owner (unwrap-panic vault-data)))
+      )
+      ;; Verify claim is ready for execution
+      (asserts! (>= stacks-block-height (get verification-deadline claim-data)) err-unauthorized)
+      (asserts! (>= (get current-confirmations claim-data) (get required-confirmations claim-data)) err-unauthorized)
+      
+      ;; Transfer vault ownership
+      (try! (nft-transfer? vault-access vault-id current-owner user))
+      
+      ;; Update vault metadata
+      (map-set vault-metadata
+        { vault-id: vault-id }
+        (merge (unwrap-panic vault-data) { owner: user, last-updated: stacks-block-height })
+      )
+      
+      ;; Update inheritance rules with new owner
+      (map-delete vault-inheritance-rules { vault-id: vault-id })
+      (map-delete inheritance-claims { vault-id: vault-id, claimant: user })
+      
+      (update-vault-activity vault-id)
+    )
+    
+    (ok true)
+  )
+)
+
+;; Reset inheritance claim (owner activity proof)
+(define-public (reset-inheritance-timer (vault-id uint))
+  (let
+    (
+      (user tx-sender)
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+    )
+    (asserts! (is-some rules) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    
+    (update-vault-activity vault-id)
+    
+    ;; Cancel any pending claims
+    (let ((rule-data (unwrap-panic rules)))
+      (map-delete inheritance-claims { vault-id: vault-id, claimant: (get beneficiary rule-data) })
+      (map-delete inheritance-claims { vault-id: vault-id, claimant: (get backup-beneficiary rule-data) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update inheritance settings
+(define-public (update-inheritance-rules (vault-id uint) (new-delay uint) (new-verification bool))
+  (let
+    (
+      (user tx-sender)
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+    )
+    (asserts! (is-some rules) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    (asserts! (> new-delay u1000) err-invalid-input)
+    
+    (let ((current-rules (unwrap-panic rules)))
+      (map-set vault-inheritance-rules
+        { vault-id: vault-id }
+        (merge current-rules 
+          { 
+            inheritance-delay: new-delay,
+            requires-verification: new-verification,
+            last-owner-activity: stacks-block-height
+          }
+        )
+      )
+    )
+    
+    (update-vault-activity vault-id)
+    (ok true)
+  )
+)
+
+;; Remove inheritance rules entirely
+(define-public (remove-inheritance-rules (vault-id uint))
+  (let
+    (
+      (user tx-sender)
+      (rules (map-get? vault-inheritance-rules { vault-id: vault-id }))
+    )
+    (asserts! (is-some rules) err-not-found)
+    (asserts! (owns-token vault-id user) err-not-token-owner)
+    
+    (map-delete vault-inheritance-rules { vault-id: vault-id })
+    (update-vault-activity vault-id)
+    (ok true)
+  )
+)
+
+
+
+
+
