@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Encrypted-OffChain.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.vault-audit-trail]
+path = 'contracts/vault-audit-trail.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
